@@ -2,37 +2,58 @@ cmake_minimum_required(VERSION 3.10)
 
 project(domain)
 
-# Set the OpenCV_DIR to the correct path
-#set(OpenCV_DIR /usr/local/lib/cmake/opencv4)
-# or
+# compilazione statica
+
+set(BUILD_SHARED_LIBS OFF)
+
+set(OpenCV_STATIC ON)
+
 if(UNIX)
-    # Per sistemi Unix-like (Linux, macOS)
+
     set(OpenCV_DIR /usr/local/share/opencv4)
-# elseif(WIN32)
-    # Per sistemi Windows
-    # set(OpenCV_DIR C:/Users/*/Desktop/opencv/build)
+
 else()
+
     message(FATAL_ERROR "Sistema operativo non supportato: compilare il programma c++ tramite docker")
+
 endif()
+
+# versioni statiche delle librerie
 
 find_package(OpenCV REQUIRED)
 
-# Websocket
 find_package(websocketpp REQUIRED)
 
-# Boost
 find_package(Boost REQUIRED)
 
-# Aggiungi le directory di inclusione
 include_directories(${OpenCV_INCLUDE_DIRS})
 
 add_executable(${PROJECT_NAME} src/main/cpp/app.cpp)
 
-target_link_libraries(${PROJECT_NAME} ${OpenCV_LIBS} websocketpp::websocketpp Boost::boost)
+# flag per il linking statico
 
-# Installazione dell'eseguibile
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
+
+# Link con le versioni statiche delle librerie
+
+target_link_libraries(${PROJECT_NAME}
+
+    -Wl,--start-group
+
+    ${OpenCV_LIBS}
+
+    websocketpp::websocketpp
+
+    Boost::boost
+
+    -static-libgcc
+
+    -static-libstdc++
+
+    -Wl,--end-group
+
+)
+
+# Modifica l'installazione per non copiare le librerie condivise
+
 install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
-
-# Installazione delle librerie OpenCV
-file(GLOB OPENCV_LIBS "/usr/local/lib/libopencv_*.so*")
-install(FILES ${OPENCV_LIBS} DESTINATION lib)
