@@ -365,18 +365,22 @@ static bool runAndSave(const string& outputFilename,
 }
 
 static bool loadCameraParams(const string& filename, Size& imageSize, Size& boardSize, Mat& cameraMatrix, Mat& distCoeffs, float& squareSize, double& totalAvgErr) {
-	FileStorage fs(filename, FileStorage::READ);
+	if (!samples::findFile(filename, false).empty()){
+	    FileStorage fs(filename, FileStorage::READ);
 
-	imageSize.width = fs["image_width"];
-	imageSize.height = fs["image_height"];
-	boardSize.width = fs["board_width"];
-	boardSize.height = fs["board_height"];
-	fs["square_size"] >> squareSize;
-	fs["camera_matrix"] >> cameraMatrix;
-	fs["distortion_coefficients"] >> distCoeffs;
+        imageSize.width = fs["image_width"];
+        imageSize.height = fs["image_height"];
+        boardSize.width = fs["board_width"];
+        boardSize.height = fs["board_height"];
+        fs["square_size"] >> squareSize;
+        fs["camera_matrix"] >> cameraMatrix;
+        fs["distortion_coefficients"] >> distCoeffs;
 
-	totalAvgErr = fs["avg_reprojection_error"];
-	return (fs.isOpened());
+        totalAvgErr = fs["avg_reprojection_error"];
+
+        return (fs.isOpened());
+	}
+	return 0;
 }
 
 const char* params
@@ -392,6 +396,7 @@ int main(int argc, char *argv[])
 {
     float squareSize, grid_width, aspectRatio = 1;
     int flags = 0;
+    double totalAvgErr = 0;
     Mat cameraMatrix, distCoeffs;
     string outputFilename;
     string images_path;
@@ -420,49 +425,48 @@ int main(int argc, char *argv[])
     cameraMatrix = Mat::eye(3, 3, CV_64F);
     //poseEstimationFromCoplanarPoints(images_path, outputFilename, boardSize, squareSize);
 
-    //if not file calibration
-/*    if(loadCameraParams(outputFilename, imageSize, boardSize, cameraMatrix, distCoeffs, squareSize, totalAvgErr)) {
+    //CALIBRATION AND PARAMS SAVED
+    if(loadCameraParams(outputFilename, imageSize, boardSize, cameraMatrix, distCoeffs, squareSize, totalAvgErr)) {
+        cout << "CALIBRATED" << endl;
     } else {
-    }*/
-    // Ottieni i percorsi di tutte le immagini nella cartella
-    vector<string> images = getImagePaths(images_path);
-    if (images.empty()) {
-        cerr << "Nessuna immagine trovata nella cartella!" << endl;
-    }
-
-    // Elenco delle immagini trovate
-    for (const auto &imgPath : images) {
-        cout << imgPath << endl;
-    }
-
-    for (const auto &imagePath : images) {
-        Mat img = imread( samples::findFile( imagePath) );
-        imageSize = img.size();
-        Mat img_corners = img.clone(), img_pose = img.clone();
-        //! [find-chessboard-corners]
-        vector<Point2f> corners;
-        bool found = findChessboardCorners(img, boardSize, corners);
-        //! [find-chessboard-corners]
-
-        if (!found)
-        {
-            cout << "Cannot find chessboard corners." << endl;
-            return 0;
-        }else{
-            imagePoints.push_back(corners);
+        // Ottieni i percorsi di tutte le immagini nella cartella
+        vector<string> images = getImagePaths(images_path);
+        if (images.empty()) {
+            cerr << "Nessuna immagine trovata nella cartella!" << endl;
         }
 
-        drawChessboardCorners(img_corners, boardSize, corners, found);
-        imshow("Chessboard corners detection", img_corners);
-        waitKey();
+        // Elenco delle immagini trovate
+        for (const auto &imgPath : images) {
+            cout << imgPath << endl;
+        }
+
+        for (const auto &imagePath : images) {
+            Mat img = imread( samples::findFile( imagePath) );
+            imageSize = img.size();
+            Mat img_corners = img.clone(), img_pose = img.clone();
+            //! [find-chessboard-corners]
+            vector<Point2f> corners;
+            bool found = findChessboardCorners(img, boardSize, corners);
+            //! [find-chessboard-corners]
+
+            if (!found)
+            {
+                cout << "Cannot find chessboard corners." << endl;
+                return 0;
+            }else{
+                imagePoints.push_back(corners);
+            }
+
+            drawChessboardCorners(img_corners, boardSize, corners, found);
+            imshow("Chessboard corners detection", img_corners);
+            waitKey();
+        }
+
+        if( imagePoints.size() > 0 )
+            runAndSave(outputFilename, imagePoints, imageSize,
+                                   boardSize, pattern, squareSize, grid_width,
+                                   aspectRatio, flags, cameraMatrix, distCoeffs);
     }
-
-    if( imagePoints.size() > 0 )
-        runAndSave(outputFilename, imagePoints, imageSize,
-                               boardSize, pattern, squareSize, grid_width,
-                               aspectRatio, flags, cameraMatrix, distCoeffs);
-
-    //else use file having params
 
     return 0;
 }
