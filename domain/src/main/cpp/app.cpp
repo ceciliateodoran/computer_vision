@@ -296,18 +296,6 @@ public:
 
                 //homogenous coordinates -> euclidean coordinates: DIVIDE the first two elements of the vector by the third
                 Point2f leftMedian((float)(result.at<float>(0,0) / result.at<float>(2,0)), (float)(result.at<float>(1,0) / result.at<float>(2,0)));
-
-                if (i == cluster_points.size() - 1) {
-                    cout << "Stampa point " << endl;
-                    for(size_t i = 0; i < point.rows; i++) {
-                        for(size_t j = 0; j < point.cols; j++) {
-                            cout << "punto x" << i << "punto y" << j << " " << point.at<float>(i, j) << endl;
-                        }
-                    }
-                    cout << "Stampa leftMedian " << endl;
-                    cout << "punto x" << leftMedian.x << "punto y" << leftMedian.y << endl;
-                }
-
                 point = (Mat_<float>(3,1) << twoDBB.at<float>(2,0), twoDBB.at<float>(2,1), 1);
                 result = homography_inv * point;
                 Point2f rightMedian((float)(result.at<float>(0,0) / result.at<float>(2,0)), (float)(result.at<float>(1,0) / result.at<float>(2,0)));
@@ -346,15 +334,6 @@ public:
                 }); 
                 imgSquare = subset.clone();
 
-                cout << "Stampa imgSquare: " << endl;
-                cout << "imgSquare row size: " << imgSquare.rows << " imgSquare col size: " << imgSquare.cols << endl;
-                for (int i = 0; i < imgSquare.rows; i++) {
-                    for (int j = 0; j < imgSquare.cols; j++) {
-                        cout << "punto: " << imgSquare.at<float>(i, j) << endl;
-                    }
-                }
-
-                //draw3D(img, corners, imgpts);
                 render3DBoundingBox(img, twoDBB, imgSquare, twoDBB_h, cluster_color);
                 twoDBB.release();
                 kp.clear();
@@ -516,45 +495,26 @@ public:
                         std::vector<cv::Scalar> clusterColors = generateDistinctColors(numClusters); 
 
                         cluster_points.clear();
-                        cluster_points.resize(numClusters + 1);
+                        cluster_points.resize(numClusters);
                         
                         for(size_t i = 0; i < dbscanLabels.size(); i++) {
                             int originalIndex = fgIndices[i];  // Indice nel vettore features originale
                             cv::Scalar color;
-                            cv::Scalar white;
 
-                            if (i == dbscanLabels.size() - 1) {
-                                white = Scalar(0, 255, 0);
-                                cluster_points[numClusters].points.push_back(Point2f(1100.0, 700.0));
-                                cluster_points[numClusters].points.push_back(Point2f(900.0, 600.0));
-                                cluster_points[numClusters].points.push_back(Point2f(950.0, 750.0));
-                                cluster_points[numClusters].color = white;
-
-                                circle(frame,
-                                    cv::Point(1100, 700),
-                                    5, white, -1);
-                                circle(frame,
-                                    cv::Point(900, 600),
-                                    5, white, -1);
-                                circle(frame,
-                                    cv::Point(950, 750),
-                                    5, white, -1);
+                            if(dbscanLabels[i] == DBSCAN<float>::NOISY) {
+                                color = cv::Scalar(0, 0, 0);
                             } else {
-                                if(dbscanLabels[i] == DBSCAN<float>::NOISY) {
-                                    color = cv::Scalar(0, 0, 0);
-                                } else {
-                                    color = clusterColors[dbscanLabels[i]];
-                                    cluster_points[dbscanLabels[i]].points.push_back(features[originalIndex].position);
-                                    cluster_points[dbscanLabels[i]].color = color;
-                                }
-                                circle(frame,
-                                    cv::Point(features[originalIndex].position.x, features[originalIndex].position.y),
-                                    5, color, -1);
-                                line(line_mask,
-                                    cv::Point(features[originalIndex].position.x, features[originalIndex].position.y),
-                                    cv::Point(features[originalIndex].oldPosition.x, features[originalIndex].oldPosition.y),
-                                    color, 2);
-                            }  
+                                color = clusterColors[dbscanLabels[i]];
+                                cluster_points[dbscanLabels[i]].points.push_back(features[originalIndex].position);
+                                cluster_points[dbscanLabels[i]].color = color;
+                            }
+                            circle(frame,
+                                cv::Point(features[originalIndex].position.x, features[originalIndex].position.y),
+                                5, color, -1);
+                            line(line_mask,
+                                cv::Point(features[originalIndex].position.x, features[originalIndex].position.y),
+                                cv::Point(features[originalIndex].oldPosition.x, features[originalIndex].oldPosition.y),
+                                color, 2);
                         }
                     } catch (const cv::Exception& e) {
                         cout << "Errore cluster!! " << endl;
@@ -576,17 +536,8 @@ public:
     }
 
     Mat render3DBoundingBox(Mat& img, const Mat& clusterBB, const Mat& cubicBBBase, int delta_Z, const Scalar& color) {
-        cout << "dentro3dbb" << endl;
         // Disegna il bounding box 2D in rosso
         //drawRectangle(img, clusterBB, Scalar(0, 0, 255));
-
-        cout << "stampa cubicbbbase" << endl;
-        for (size_t i = 0; i < cubicBBBase.rows; i++) {
-            for (size_t j = 0; j < cubicBBBase.rows; j++) {
-                cout << "punto(x,y) " << cubicBBBase.at<int>(i, j) << endl;
-            }
-        }
-        cout << "color post cubicccccc " << color << endl;
 
         // Disegna la base del bounding box 3D
         drawRectangle(img, cubicBBBase, color);
@@ -596,17 +547,16 @@ public:
         for(int i = 0; i < cubicBBTip.rows; i++) {
             cubicBBTip.at<float>(i, 1) = cubicBBBase.at<float>(i, 1) - delta_Z;
         }
-        cout << "dopo for dentro3dbb" << endl;
+
         // Disegna la punta del bounding box 3D
         drawRectangle(img, cubicBBTip, color);
-        cout << "dopo 2ndo draw" << endl;
+
         // Connette la base con la punta
         for(int i = 0; i < 4; i++) {
             Point2f base_point(cubicBBBase.at<float>(i, 0), cubicBBBase.at<float>(i, 1));
             Point2f tip_point(cubicBBTip.at<float>(i, 0), cubicBBTip.at<float>(i, 1));
             line(img, base_point, tip_point, color, 2);
         }
-        cout << "fine draw" << endl;
         return img;
     }
 
@@ -1239,9 +1189,7 @@ int main(int argc, char** argv) {
     //end CALIBRATION AND PARAMS SAVED
 
     //omografia
-    cout << "Prima di Homography" << endl;
     auto [homography, homographyInv] = calc_homography("res/floor_surface/piano_pav (4).jpg", cameraMatrix, distCoeffs, boardSize);
-    cout << "<Dopo> Homography" << endl;
 
     VideoCapture cap;
     if (file.empty())
@@ -1262,9 +1210,9 @@ int main(int argc, char** argv) {
     OpticalFlowTracker tracker(x, y, width, height);
     Mat frame;
     
-    //namedWindow("kmeans", WINDOW_AUTOSIZE);
-    namedWindow("dbscan", WINDOW_AUTOSIZE);
-    //namedWindow("bw-morph", WINDOW_AUTOSIZE);
+    namedWindow("bw-morph", WINDOW_AUTOSIZE);
+    namedWindow("bounding box 3D", WINDOW_AUTOSIZE);
+    namedWindow("dbscan clustering", WINDOW_AUTOSIZE);
 
     // Training phase - first 10 frames
     for(int i = 0; i < 10; i++) {
@@ -1285,19 +1233,13 @@ int main(int argc, char** argv) {
             break;
         }
 
-        int64 t = getTickCount();
         auto [kmeans, processed, morph] = tracker.process(frame);
-        t = getTickCount() - t;
-        double fps = getTickFrequency() / (double)t;
+        Mat processed_clone = processed.clone();
 
-        putText(processed, "FPS: " + to_string(int(fps)), Point(10, 30), 
-                FONT_HERSHEY_SIMPLEX, 1, Scalar(0,255,0), 2);
-
-        Mat res_img = tracker.process3D(processed, homography, homographyInv);
-        imshow("result", res_img);
-        //imshow("kmeans", kmeans);
-        imshow("dbscan", processed);
-        //imshow("bw-morph", morph);
+        Mat res_img = tracker.process3D(processed_clone, homography, homographyInv);
+        imshow("bw-morph", morph);
+        imshow("bounding box 3D", res_img);
+        imshow("dbscan clustering", processed);
 
         char key = (char)waitKey(delay);
         if (key == 27) break;  // ESC
