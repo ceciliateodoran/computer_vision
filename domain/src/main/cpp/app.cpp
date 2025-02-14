@@ -31,19 +31,16 @@ namespace fs = std::filesystem;
 enum Pattern { CHESSBOARD, CIRCLES_GRID, ASYMMETRIC_CIRCLES_GRID, CHARUCOBOARD};
 
 class OpticalFlowTracker {
-    // Struttura per raggruppare punti simili
-    struct MovementGroup {
-        float magnitude;
-        float angle;
-        int count;
-        std::vector<size_t> pointIndices;  // Indici dei punti che appartengono a questo gruppo
-    };
-
     struct FeaturePoint {
         Point2f position;      // posizione corrente
         Point2f oldPosition;   // posizione precedente
-        float magnitude;       // modulo del vettore spostamento
-        float angle;          // verso (angolo) del vettore spostamento
+    };
+
+    struct ClusterData {
+        std::vector<cv::Point2f> points;
+        cv::Scalar color;
+        
+        ClusterData(const cv::Scalar& c = cv::Scalar(0,0,0)) : color(c) {}
     };
 
     // Parametri per Shi-Tomasi
@@ -66,15 +63,18 @@ class OpticalFlowTracker {
     cv::Ptr<cv::BackgroundSubtractorMOG2> backSub;
 
     // Matrici e vettori necessari
-    cv::Mat mask;
+    cv::Mat morph;
+    cv::Mat ROI_f;
     cv::Mat fgMask;
     cv::Mat old_gray;
     cv::Mat line_mask;
+    cv::Mat line_mask_kmeans;
+    cv::Mat frame_gray;
+    cv::Mat blurred_f;
     std::vector<cv::Point2f> shi_tomasi_keypoints;
     std::vector<cv::Point2f> old_keypoints;
     std::vector<cv::Scalar> colors;
     int frame_counter;
-    int lastForegroundCount;
 
     // Kernels per trasformazioni morfologiche
     cv::Mat kernel_3;
@@ -86,14 +86,16 @@ class OpticalFlowTracker {
     bool useWindow;
 
 private:
+    std::vector<ClusterData> cluster_points;
+
+private:
     // Modifica la funzione helper per includere le informazioni di gruppo
     NDArray<float, 2> convertToNDArray(const Mat& normalizedData) {
-        NDArray<float, 2> arrayData({(size_t)normalizedData.rows, (size_t)normalizedData.cols});
+        NDArray<float, 2> arrayData({(size_t)normalizedData.rows, (size_t)2});
         
         for(int i = 0; i < normalizedData.rows; i++) {
-            for(int j = 0; j < normalizedData.cols; j++) {
-                arrayData[i][j] = normalizedData.at<float>(i, j);
-            }
+            arrayData[i][0] = normalizedData.at<float>(i, 0);
+            arrayData[i][1] = normalizedData.at<float>(i, 1);
         }
         
         return arrayData;
@@ -102,12 +104,12 @@ private:
 public:
     OpticalFlowTracker(int x = 0, int y = 0, int width = 0, int height = 0)
         : maxCorners(1000),
-          qualityLevel(0.3),
-          minDistance(5.0),
+          qualityLevel(0.1), // previous 0.3
+          minDistance(7.0), // previous 7.0
           blockSize(7),
           criteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 10, 0.03),
-          winSize(15, 15),
-          maxLevel(2),
+          winSize(15, 15), // 21 21 
+          maxLevel(2), // 3
 
           // Inizializzazione dei nuovi parametri
           magnitudeTolerance(2.5f),
@@ -115,7 +117,6 @@ public:
           minOccurrences(7),
 
           frame_counter(0),
-          lastForegroundCount(0),
           detectionWindow(x, y, width, height),
           useWindow(width > 0 && height > 0)
     {
@@ -131,6 +132,23 @@ public:
                 rng.uniform(0,255),
                 rng.uniform(0,255)
             ));
+        }
+    }
+
+    void cleanup() {
+        fgMask.release();
+        line_mask.release();
+        line_mask_kmeans.release();
+        frame_gray.release();
+        blurred_f.release();
+        ROI_f.release();
+        morph.release();
+    }
+
+    ~OpticalFlowTracker() {
+        cleanup();
+        if (backSub) {
+            backSub.release();
         }
     }
 
@@ -150,13 +168,9 @@ public:
     }
 
     // Funzione per raggruppare i punti simili e contare le occorrenze
-    std::pair<std::vector<FeaturePoint>, std::vector<MovementGroup>> filterByOccurrences(const std::vector<Point2f>& current,
-                                                const std::vector<Point2f>& previous,
-                                                int minOccurrences,
-                                                float magTolerance,
-                                                float angTolerance) {
+    std::vector<FeaturePoint> filterByOccurrences(const std::vector<Point2f>& current,
+                                                const std::vector<Point2f>& previous) {
         std::vector<FeaturePoint> allFeatures;
-        std::vector<MovementGroup> groups;
         
         // Prima passiamo crea tutti i FeaturePoint
         for(size_t i = 0; i < current.size(); i++) {
@@ -164,74 +178,28 @@ public:
             fp.position = current[i];
             fp.oldPosition = previous[i];
             
-            // Calcola il vettore spostamento
-            Point2f diff = current[i] - previous[i];
-            
-            // Calcola modulo
-            fp.magnitude = sqrt(diff.x*diff.x + diff.y*diff.y);
-            
-            // Calcola angolo (verso) in radianti
-            fp.angle = atan2(diff.y, diff.x);
-            if(fp.angle < 0) {
-                fp.angle += 2.0f * static_cast<float>(CV_PI);
-            }
-            
             allFeatures.push_back(fp);
         }
         
-        // Raggruppa i punti con movimento simile
-        std::vector<bool> assigned(allFeatures.size(), false);
-        for(size_t i = 0; i < allFeatures.size(); i++) {
-            if(assigned[i]) continue;
-            
-            MovementGroup newGroup;
-            newGroup.magnitude = allFeatures[i].magnitude;
-            newGroup.angle = allFeatures[i].angle;
-            newGroup.count = 1;
-            newGroup.pointIndices.push_back(i);
-            assigned[i] = true;
-            
-            // Cerca altri punti con movimento simile
-            for(size_t j = i + 1; j < allFeatures.size(); j++) {
-                if(!assigned[j] && areSimilarMovements(
-                    newGroup.magnitude, newGroup.angle,
-                    allFeatures[j].magnitude, allFeatures[j].angle,
-                    magTolerance, angTolerance)) {
-                    newGroup.count++;
-                    newGroup.pointIndices.push_back(j);
-                    assigned[j] = true;
-                }
-            }
-            
-            groups.push_back(newGroup);
-        }
-        
-        return {allFeatures, groups};
+        return allFeatures;
     }
 
-    std::pair<std::vector<FeaturePoint>, std::vector<MovementGroup>> prepareFeaturePoints(
-        const std::vector<Point2f>& current,
-        const std::vector<Point2f>& previous,
-        int minOccurrences,
-        float magTolerance,
-        float angTolerance) {
+    std::vector<FeaturePoint> prepareFeaturePoints(
+        const std::vector<Point2f>& current, const std::vector<Point2f>& previous) {
     
         // Prima filtra i punti basandosi sulle occorrenze
-        return filterByOccurrences(current, previous, minOccurrences, magTolerance, angTolerance);
+        return filterByOccurrences(current, previous);
     }
 
-    Mat prepareDataForClustering(const vector<FeaturePoint>& features, const vector<MovementGroup>& groups) {
+    Mat prepareDataForClustering(const vector<FeaturePoint>& features) {
         if(features.empty()) return Mat();
 
-        // Aumentiamo il numero di colonne per includere le feature dei gruppi
-        Mat data(features.size(), 6, CV_32F);  // x,y,magnitude,angle + group_magnitude,group_size
+        // Aumentiamo il numero di colonne per includere le nuove feature
+        Mat data(features.size(), 2, CV_32F);  // x,y
 
         // Trova i valori min e max per normalizzazione
         float minX = features[0].position.x, maxX = features[0].position.x;
         float minY = features[0].position.y, maxY = features[0].position.y;
-        float minMag = features[0].magnitude, maxMag = features[0].magnitude;
-        float minGroupMag = groups[0].magnitude, maxGroupMag = groups[0].magnitude;
-        float minGroupSize = groups[0].count, maxGroupSize = groups[0].count;
         
         // Prima passata per trovare i range
         for(const auto& fp : features) {
@@ -239,33 +207,12 @@ public:
             maxX = max(maxX, fp.position.x);
             minY = min(minY, fp.position.y);
             maxY = max(maxY, fp.position.y);
-            minMag = min(minMag, fp.magnitude);
-            maxMag = max(maxMag, fp.magnitude);
         }
         
-        for(const auto& group : groups) {
-            minGroupMag = min(minGroupMag, group.magnitude);
-            maxGroupMag = max(maxGroupMag, group.magnitude);
-            minGroupSize = min(minGroupSize, (float)group.count);
-            maxGroupSize = max(maxGroupSize, (float)group.count);
-        }
-
         // Seconda passata per riempire la matrice
         for(size_t i = 0; i < features.size(); i++) {
-            // Feature normali normalizzate
-            data.at<float>(i, 0) = (features[i].position.x - minX) / (maxX - minX + 1e-5);
-            data.at<float>(i, 1) = (features[i].position.y - minY) / (maxY - minY + 1e-5);
-            data.at<float>(i, 2) = (features[i].magnitude - minMag) / (maxMag - minMag + 1e-5);
-            data.at<float>(i, 3) = features[i].angle / (2 * CV_PI);
-
-            // Trova il gruppo corrispondente e aggiungi le sue feature
-            for(const auto& group : groups) {
-                if(std::find(group.pointIndices.begin(), group.pointIndices.end(), i) != group.pointIndices.end()) {
-                    data.at<float>(i, 4) = (group.magnitude - minGroupMag) / (maxGroupMag - minGroupMag + 1e-5);
-                    data.at<float>(i, 5) = (group.count - minGroupSize) / (maxGroupSize - minGroupSize + 1e-5);
-                    break;
-                }
-            }
+            data.at<float>(i, 0) = (features[i].position.x - minX) / (maxX - minX);
+            data.at<float>(i, 1) = (features[i].position.y - minY) / (maxY - minY);
         }
 
         return data;
@@ -276,48 +223,193 @@ public:
 
         if (i == 0) {
             fgMask = cv::Mat::zeros(frame.size(), CV_8UC1);
-            mask = cv::Mat::zeros(frame.size(), CV_8UC3);
             line_mask = cv::Mat::zeros(frame.size(), CV_8UC3);
+            line_mask_kmeans = cv::Mat::zeros(frame.size(), CV_8UC3);
         }
 
-        cv::Mat frame_gray;
         cv::cvtColor(frame, frame_gray, cv::COLOR_BGR2GRAY);
-        cv::Mat blurred_f;
         cv::GaussianBlur(frame_gray, blurred_f, cv::Size(5, 5), 0);
         backSub->apply(blurred_f, fgMask, -1);
+    }
 
-        old_gray = frame_gray.clone();
+    void initialize() {
+        morph = fgMask.clone();
+        cv::morphologyEx(morph, morph, cv::MORPH_CLOSE, kernel_5);
+        cv::morphologyEx(morph, morph, cv::MORPH_OPEN, kernel_3);
+        cv::dilate(morph, morph, kernel_3);
+
+        cv::bitwise_and(frame_gray, morph, ROI_f);
+        cv::goodFeaturesToTrack(ROI_f, shi_tomasi_keypoints,
+            maxCorners,
+            qualityLevel,
+            minDistance,
+            cv::Mat(),
+            blockSize);
+
+        old_gray = frame_gray.clone(); 
+        frame_counter = 0;
+        morph = fgMask.clone();
+    }
+
+    Mat process3D(Mat& img, const Mat& homography, const Mat& homography_inv){
+        try{
+            for (int i = 0; i < cluster_points.size(); i++){
+                int npoints = cluster_points[i].points.size();
+                vector<Point2f> kp_float = cluster_points[i].points;
+                Scalar cluster_color = cluster_points[i].color;
+
+                vector<Point2i> kp;
+                kp.reserve(kp_float.size());  // Pre-alloca spazio per efficienza
+
+                // Converte ogni punto da float a int
+                for(const auto &pt : kp_float) {
+                    kp.push_back(Point2i(cvRound(pt.x), cvRound(pt.y)));
+                }
+
+                //building cluster fake 2D bounding box
+                vector<Point2i> h_ordered = kp;
+                sort(h_ordered.begin(), h_ordered.end(),
+                    [](const Point2i& a, const Point2i& b) {
+                        return a.x < b.x;
+                    });
+                Point2i leftest = h_ordered[0];
+
+                vector<Point2i> v_ordered = kp;
+                sort(v_ordered.begin(), v_ordered.end(),
+                    [](const Point2i& a, const Point2i& b) {
+                        return a.y < b.y;
+                    });
+                Point2i highest = v_ordered[0];
+
+                int twoDBB_w = abs(h_ordered[0].x - h_ordered[npoints-1].x);
+                int twoDBB_h = abs(v_ordered[0].y - v_ordered[npoints-1].y);
+
+                Mat twoDBB = (Mat_<float>(4,2) << 
+                    leftest.x, highest.y,
+                    leftest.x + twoDBB_w, highest.y,
+                    leftest.x + twoDBB_w, highest.y + twoDBB_h,
+                    leftest.x, highest.y + twoDBB_h);
+
+                //euclidean coordinates -> homogenous coordinates: add 1 as the third element of the array
+                Mat point = (Mat_<float>(3,1) << twoDBB.at<float>(3,0), twoDBB.at<float>(3,1), 1); // Mat point = Mat(3, 1, CV_32F, p);
+                Mat result = homography_inv * point;
+
+                //homogenous coordinates -> euclidean coordinates: DIVIDE the first two elements of the vector by the third
+                Point2f leftMedian((float)(result.at<float>(0,0) / result.at<float>(2,0)), (float)(result.at<float>(1,0) / result.at<float>(2,0)));
+
+                if (i == cluster_points.size() - 1) {
+                    cout << "Stampa point " << endl;
+                    for(size_t i = 0; i < point.rows; i++) {
+                        for(size_t j = 0; j < point.cols; j++) {
+                            cout << "punto x" << i << "punto y" << j << " " << point.at<float>(i, j) << endl;
+                        }
+                    }
+                    cout << "Stampa leftMedian " << endl;
+                    cout << "punto x" << leftMedian.x << "punto y" << leftMedian.y << endl;
+                }
+
+                point = (Mat_<float>(3,1) << twoDBB.at<float>(2,0), twoDBB.at<float>(2,1), 1);
+                result = homography_inv * point;
+                Point2f rightMedian((float)(result.at<float>(0,0) / result.at<float>(2,0)), (float)(result.at<float>(1,0) / result.at<float>(2,0)));
+
+                //use the absolute difference between left and right to compute the size of the projected square in CHESSBOARD mesurements
+                float deltax = std::abs(leftMedian.x - rightMedian.x);
+                deltax = deltax/2;
+
+                //homographedSquare is the base of the 3D bounding box expressed in homogenous chessboard coordinates
+                Mat homographedSquare = (Mat_<float>(4, 3) <<
+                    leftMedian.x,  leftMedian.y + deltax,  1.0f,
+                    rightMedian.x, rightMedian.y + deltax, 1.0f,
+                    rightMedian.x, rightMedian.y - deltax, 1.0f,
+                    leftMedian.x,  leftMedian.y - deltax,  1.0f);
+
+                //convert each point to pixel coordinates using homography matrix
+                Mat hcImgSquare = Mat::zeros(4, 3, CV_32F);
+                
+                for (int j = 0; j < 4; j++) {
+                    Mat point = (Mat_<float>(3,1) <<
+                        homographedSquare.at<float>(j,0),
+                        homographedSquare.at<float>(j,1),
+                        homographedSquare.at<float>(j,2));
+                    Mat result = homography * point;
+                    //convert homogenous pixel coordinates in euclidean pixel coordinates
+                    hcImgSquare.at<float>(j,0) = result.at<float>(0) / result.at<float>(2);
+                    hcImgSquare.at<float>(j,1) = result.at<float>(1) / result.at<float>(2);
+                    hcImgSquare.at<float>(j,2) = 0;
+                }
+
+                //imgSquare is the integer euclidean pixel coordinates of the base of the 3d bounding box
+                Mat imgSquare;
+                Mat subset = hcImgSquare.colRange(0, 2); //hcImgSquare[:,0:2].reshape((4,2)))
+                subset.forEach<int>([](int& value, const int* position) -> void {
+                    value = cvRound(value); // Arrotonda il valore
+                }); 
+                imgSquare = subset.clone();
+
+                cout << "Stampa imgSquare: " << endl;
+                cout << "imgSquare row size: " << imgSquare.rows << " imgSquare col size: " << imgSquare.cols << endl;
+                for (int i = 0; i < imgSquare.rows; i++) {
+                    for (int j = 0; j < imgSquare.cols; j++) {
+                        cout << "punto: " << imgSquare.at<float>(i, j) << endl;
+                    }
+                }
+
+                //draw3D(img, corners, imgpts);
+                render3DBoundingBox(img, twoDBB, imgSquare, twoDBB_h, cluster_color);
+                twoDBB.release();
+                kp.clear();
+            }
+        } catch (const cv::Exception& e){
+            cout << "error in process3D" << endl;
+        }
+        return img;
     }
 
     // Genera N colori diversi basati sul numero di cluster trovati
     std::vector<cv::Scalar> generateDistinctColors(int n) {
-        std::vector<cv::Scalar> colors(n);
+        std::vector<cv::Scalar> colors;
         
-        for(int i = 0; i < n; i++) {
-            float hue = 360.0f * i / n;
-            float sat = 0.9f;    // Saturazione fissa alta
-            float val = 0.9f;    // Valore fisso alto per garantire colori brillanti
-            
-            cv::Mat hsv(1, 1, CV_32FC3, cv::Scalar(hue, sat, val));
-            cv::Mat bgr;
-            cv::cvtColor(hsv, bgr, cv::COLOR_HSV2BGR);
-            
-            cv::Vec3f color = bgr.at<cv::Vec3f>(0, 0);
-            colors[i] = cv::Scalar(
-                color[0] * 255,
-                color[1] * 255,
-                color[2] * 255
-            );
+        // Colori base altamente contrastanti
+        std::vector<cv::Scalar> baseColors = {
+            cv::Scalar(0, 0, 255),     // Rosso
+            cv::Scalar(0, 255, 255),   // Giallo
+            cv::Scalar(255, 0, 0),     // Blu
+            cv::Scalar(0, 255, 0),     // Verde
+            cv::Scalar(255, 0, 255),   // Magenta
+            cv::Scalar(255, 128, 0),   // Blu chiaro
+            cv::Scalar(0, 128, 255),   // Arancione
+            cv::Scalar(255, 0, 128)    // Viola
+        };
+        
+        // Prendiamo i primi n colori necessari
+        for(int i = 0; i < n && i < baseColors.size(); i++) {
+            colors.push_back(baseColors[i]);
         }
+        
+        // Se servono più colori, li generiamo con HSV
+        if(n > baseColors.size()) {
+            float hueStep = 360.0f / (n - baseColors.size());
+            for(int i = baseColors.size(); i < n; i++) {
+                cv::Mat hsv(1, 1, CV_32FC3);
+                hsv.at<cv::Vec3f>(0,0)[0] = hueStep * (i - baseColors.size()) / 2; // hue (0-180)
+                hsv.at<cv::Vec3f>(0,0)[1] = 1.0f;  // saturazione massima
+                hsv.at<cv::Vec3f>(0,0)[2] = 1.0f;  // valore massimo
+                
+                cv::Mat bgr;
+                cv::cvtColor(hsv, bgr, cv::COLOR_HSV2BGR);
+                cv::Vec3f color = bgr.at<cv::Vec3f>(0,0);
+                colors.push_back(cv::Scalar(color[0] * 255, color[1] * 255, color[2] * 255));
+            }
+        }
+        
         return colors;
     }
 
-    std::pair<cv::Mat, cv::Mat> process(cv::Mat& frame) {
-        if(frame.empty()) return {frame, cv::Mat()};
+    std::tuple<cv::Mat, cv::Mat, cv::Mat> process(cv::Mat& frame) {
+        if(frame.empty()) return std::make_tuple(cv::Mat(), cv::Mat(), cv::Mat());
 
-        cv::Mat frame_gray;
+        old_gray = frame_gray.clone();
         cv::cvtColor(frame, frame_gray, cv::COLOR_BGR2GRAY);
-        cv::Mat blurred_f;
         cv::GaussianBlur(frame_gray, blurred_f, cv::Size(5, 5), 0);
 
         if(frame_counter == 10) {
@@ -328,16 +420,16 @@ public:
             backSub->apply(blurred_f, fgMask, -1);
         }
 
-        if(frame_counter == 15) {
+        if(frame_counter == 14) {
             line_mask = cv::Mat::zeros(frame.size(), CV_8UC3);
+            line_mask_kmeans = cv::Mat::zeros(frame.size(), CV_8UC3);
             old_keypoints = shi_tomasi_keypoints;
 
-            cv::Mat morph = fgMask.clone();
+            morph = fgMask.clone();
             cv::morphologyEx(morph, morph, cv::MORPH_CLOSE, kernel_3);
             cv::morphologyEx(morph, morph, cv::MORPH_OPEN, kernel_3);
             cv::dilate(morph, morph, kernel_3);
 
-            cv::Mat ROI_f;
             cv::bitwise_and(frame_gray, morph, ROI_f);
             cv::goodFeaturesToTrack(ROI_f, shi_tomasi_keypoints,
                 maxCorners,
@@ -345,50 +437,13 @@ public:
                 minDistance,
                 cv::Mat(),
                 blockSize);
-
-            if(shi_tomasi_keypoints.empty()) {
-                cv::goodFeaturesToTrack(frame_gray, shi_tomasi_keypoints,
-                    maxCorners,
-                    qualityLevel,
-                    minDistance,
-                    cv::Mat(),
-                    blockSize);
-            }
-        }
-
-        if(frame_counter == 0 || shi_tomasi_keypoints.empty()) {
-            cv::Mat morph = fgMask.clone();
-            cv::morphologyEx(morph, morph, cv::MORPH_CLOSE, kernel_5);
-            cv::morphologyEx(morph, morph, cv::MORPH_OPEN, kernel_3);
-            cv::dilate(morph, morph, kernel_3);
-
-            cv::Mat ROI_f;
-            cv::bitwise_and(frame_gray, morph, ROI_f);
-            cv::goodFeaturesToTrack(ROI_f, shi_tomasi_keypoints,
-                maxCorners,
-                qualityLevel,
-                minDistance,
-                cv::Mat(),
-                blockSize);
-
-            if(shi_tomasi_keypoints.empty()) {
-                cv::goodFeaturesToTrack(frame_gray, shi_tomasi_keypoints,
-                    maxCorners,
-                    qualityLevel,
-                    minDistance,
-                    cv::Mat(),
-                    blockSize);
-            }
-
-            old_keypoints = shi_tomasi_keypoints;
-            old_gray = frame_gray.clone();
-            frame_counter = (frame_counter + 1) % 30;
-            return {frame, fgMask};
         }
 
         std::vector<cv::Point2f> displaced_kp;
         std::vector<uchar> status;
         std::vector<float> err;
+
+        cv::Mat kmeansOutput;
 
         try {
             cv::calcOpticalFlowPyrLK(old_gray, frame_gray,
@@ -400,10 +455,12 @@ public:
         } catch (const cv::Exception& e) {
             shi_tomasi_keypoints.clear();
             frame_counter = 0;
-            return {frame, fgMask};
+            return std::make_tuple(cv::Mat(), frame, fgMask);
         }
 
         std::vector<cv::Point2f> good_new, good_old;
+        good_new.reserve(displaced_kp.size());
+        good_old.reserve(displaced_kp.size());
         for(size_t i = 0; i < displaced_kp.size(); i++) {
             if(status[i]) {
                 good_new.push_back(displaced_kp[i]);
@@ -412,114 +469,95 @@ public:
         }
 
         if(!good_new.empty()) {
-            auto [features, groups] = prepareFeaturePoints(
-                good_new, 
-                good_old,
-                minOccurrences,
-                magnitudeTolerance, 
-                angleTolerance
-            );
+            auto features = prepareFeaturePoints(good_new, good_old);
                 
             std::vector<int> clusters;
                 
-            // TODO: Check
-            if(features.size() < 4) {
-                clusters.resize(features.size(), 0);
-            } else {
-                Mat data = prepareDataForClustering(features, groups);
+            if(!features.empty()) {
+                Mat data = prepareDataForClustering(features);
                 if(!data.empty()) {
-                    Mat labels;
-                    Mat centers;
-
                     try {
-                        kmeans(data, 2, labels,
-                            TermCriteria(TermCriteria::EPS + TermCriteria::COUNT, 10, 1.0),
-                            3, KMEANS_PP_CENTERS, centers);
+                        // Raccogli i dati di foreground mantenendo la normalizzazione
+                        std::vector<int> fgIndices;
+                        for(int i = 0; i < data.rows; i++) {
+                            fgIndices.push_back(i);
+                        }
+
+                        // Converti i punti in NDArray, includendo le informazioni di gruppo
+                        NDArray<float, 2> pointsArray = convertToNDArray(data); //convertToNDArray(fgData);
+                        
+                        // Crea e applica DBSCAN con i parametri aggiustati per considerare le nuove feature
+                        // Aumentiamo leggermente eps perché ora abbiamo più dimensioni
+                        DBSCAN<float> dbscan(pointsArray, 0.2f, 6); // 0.3 8
+                        dbscan.run();
+
+                        // Ottieni le etichette
+                        const auto& dbscanLabels = dbscan.labels();
+
+                        int numClusters = dbscan.nClusters();
 
                         // DEBUG
-                        /* int count0 = 0, count1 = 0;
-                        for(int i = 0; i < labels.rows; i++) {
-                            if(labels.at<int>(i) == 0) count0++;
-                            else count1++;
-                        }
-                        std::cout << "K-means: cluster 0: " << count0 << " punti, cluster 1: " << count1 << " punti" << std::endl; */
-
-
-                        // Raccogli i dati di foreground mantenendo la normalizzazione
-                        Mat fgData;
-                        std::vector<int> fgIndices;
-                        for(int i = 0; i < labels.rows; i++) {
-                            if(labels.at<int>(i) == 1) {
-                                fgIndices.push_back(i);
-                                fgData.push_back(data.row(i));
+                        /* std::cout << "DBSCAN ha creato " << numClusters << " cluster" << std::endl;
+                        // Conta quanti punti per ogni cluster
+                        std::vector<int> clusterCounts(numClusters + 1, 0); // +1 per i punti NOISY
+                        for(size_t i = 0; i < dbscanLabels.size(); i++) {
+                            if(dbscanLabels[i] == DBSCAN<float>::NOISY) {
+                                clusterCounts[numClusters]++;  // L'ultimo indice per i punti NOISY
+                            } else {
+                                clusterCounts[dbscanLabels[i]]++;
                             }
                         }
+                        for(int i = 0; i < numClusters; i++) {
+                            std::cout << "Cluster " << i << ": " << clusterCounts[i] << " punti" << std::endl;
+                        }
+                        std::cout << "Punti NOISY: " << clusterCounts[numClusters] << std::endl; */
 
-                        if(!fgData.empty()) {
-                            try {
-                                // Converti i punti in NDArray, includendo le informazioni di gruppo
-                                NDArray<float, 2> pointsArray = convertToNDArray(fgData);
-                                
-                                // Crea e applica DBSCAN con i parametri aggiustati per considerare le nuove feature
-                                // Aumentiamo leggermente eps perché ora abbiamo più dimensioni
-                                DBSCAN<float> dbscan(pointsArray, 1.00f, 4, 4);
-                                dbscan.run();
+                        // Crea colori casuali per ogni cluster
+                        std::vector<cv::Scalar> clusterColors = generateDistinctColors(numClusters); 
 
-                                // Ottieni le etichette
-                                const auto& dbscanLabels = dbscan.labels();
+                        cluster_points.clear();
+                        cluster_points.resize(numClusters + 1);
+                        
+                        for(size_t i = 0; i < dbscanLabels.size(); i++) {
+                            int originalIndex = fgIndices[i];  // Indice nel vettore features originale
+                            cv::Scalar color;
+                            cv::Scalar white;
 
-                                int numClusters = dbscan.nClusters();
+                            if (i == dbscanLabels.size() - 1) {
+                                white = Scalar(0, 255, 0);
+                                cluster_points[numClusters].points.push_back(Point2f(1100.0, 700.0));
+                                cluster_points[numClusters].points.push_back(Point2f(900.0, 600.0));
+                                cluster_points[numClusters].points.push_back(Point2f(950.0, 750.0));
+                                cluster_points[numClusters].color = white;
 
-                                // DEBUG
-                                /* std::cout << "DBSCAN ha creato " << numClusters << " cluster" << std::endl;
-                                // Conta quanti punti per ogni cluster
-                                std::vector<int> clusterCounts(numClusters + 1, 0); // +1 per i punti NOISY
-                                for(size_t i = 0; i < dbscanLabels.size(); i++) {
-                                    if(dbscanLabels[i] == DBSCAN<float>::NOISY) {
-                                        clusterCounts[numClusters]++;  // L'ultimo indice per i punti NOISY
-                                    } else {
-                                        clusterCounts[dbscanLabels[i]]++;
-                                    }
+                                circle(frame,
+                                    cv::Point(1100, 700),
+                                    5, white, -1);
+                                circle(frame,
+                                    cv::Point(900, 600),
+                                    5, white, -1);
+                                circle(frame,
+                                    cv::Point(950, 750),
+                                    5, white, -1);
+                            } else {
+                                if(dbscanLabels[i] == DBSCAN<float>::NOISY) {
+                                    color = cv::Scalar(0, 0, 0);
+                                } else {
+                                    color = clusterColors[dbscanLabels[i]];
+                                    cluster_points[dbscanLabels[i]].points.push_back(features[originalIndex].position);
+                                    cluster_points[dbscanLabels[i]].color = color;
                                 }
-                                for(int i = 0; i < numClusters; i++) {
-                                    std::cout << "Cluster " << i << ": " << clusterCounts[i] << " punti" << std::endl;
-                                }
-                                std::cout << "Punti NOISY: " << clusterCounts[numClusters] << std::endl; */
-
-                                // Crea colori casuali per ogni cluster
-                                std::vector<cv::Scalar> clusterColors = generateDistinctColors(numClusters); 
-
-                                // Dopo DBSCAN
-                                for(size_t i = 0; i < dbscanLabels.size(); i++) {
-                                    int originalIndex = fgIndices[i];  // Indice nel vettore features originale
-                                    cv::Scalar color;
-                                    
-                                    if(dbscanLabels[i] == DBSCAN<float>::NOISY) {
-                                        color = cv::Scalar(0, 0, 0);
-                                        circle(frame,
-                                        cv::Point(features[originalIndex].position.x, features[originalIndex].position.y),
-                                            5, color, -1);
-                                        line(line_mask,
-                                            cv::Point(features[originalIndex].position.x, features[originalIndex].position.y),
-                                            cv::Point(features[originalIndex].oldPosition.x, features[originalIndex].oldPosition.y),
-                                            color, 2);
-                                    } else {
-                                        color = clusterColors[dbscanLabels[i]];
-                                        circle(frame,
-                                            cv::Point(features[originalIndex].position.x, features[originalIndex].position.y),
-                                            5, color, -1);
-                                        line(line_mask,
-                                            cv::Point(features[originalIndex].position.x, features[originalIndex].position.y),
-                                            cv::Point(features[originalIndex].oldPosition.x, features[originalIndex].oldPosition.y),
-                                            color, 2);
-                                    }
-                                }
-                            } catch (const std::exception& e) {
-                                std::cerr << "DBSCAN error: " << e.what() << std::endl;
-                                clusters.resize(features.size(), 0);
-                            }
+                                circle(frame,
+                                    cv::Point(features[originalIndex].position.x, features[originalIndex].position.y),
+                                    5, color, -1);
+                                line(line_mask,
+                                    cv::Point(features[originalIndex].position.x, features[originalIndex].position.y),
+                                    cv::Point(features[originalIndex].oldPosition.x, features[originalIndex].oldPosition.y),
+                                    color, 2);
+                            }  
                         }
                     } catch (const cv::Exception& e) {
+                        cout << "Errore cluster!! " << endl;
                         clusters.resize(features.size(), 0);
                     }
                 } else {
@@ -531,16 +569,62 @@ public:
         cv::Mat output;
         cv::add(frame, line_mask, output);
 
-        old_gray = frame_gray.clone();
         shi_tomasi_keypoints = displaced_kp;
-        frame_counter = (frame_counter + 1) % 30;
+        frame_counter = (frame_counter + 1) % 15;
 
-        cv::Mat morph = fgMask.clone();
-        cv::morphologyEx(morph, morph, cv::MORPH_CLOSE, kernel_3);
-        cv::morphologyEx(morph, morph, cv::MORPH_OPEN, kernel_3);
-        cv::dilate(morph, morph, kernel_3);
+        return std::make_tuple(kmeansOutput, output, morph);
+    }
 
-        return {output, morph};
+    Mat render3DBoundingBox(Mat& img, const Mat& clusterBB, const Mat& cubicBBBase, int delta_Z, const Scalar& color) {
+        cout << "dentro3dbb" << endl;
+        // Disegna il bounding box 2D in rosso
+        //drawRectangle(img, clusterBB, Scalar(0, 0, 255));
+
+        cout << "stampa cubicbbbase" << endl;
+        for (size_t i = 0; i < cubicBBBase.rows; i++) {
+            for (size_t j = 0; j < cubicBBBase.rows; j++) {
+                cout << "punto(x,y) " << cubicBBBase.at<int>(i, j) << endl;
+            }
+        }
+        cout << "color post cubicccccc " << color << endl;
+
+        // Disegna la base del bounding box 3D
+        drawRectangle(img, cubicBBBase, color);
+        Mat cubicBBTip = cubicBBBase.clone();
+
+        // Modifica le coordinate y sottraendo delta_Z
+        for(int i = 0; i < cubicBBTip.rows; i++) {
+            cubicBBTip.at<float>(i, 1) = cubicBBBase.at<float>(i, 1) - delta_Z;
+        }
+        cout << "dopo for dentro3dbb" << endl;
+        // Disegna la punta del bounding box 3D
+        drawRectangle(img, cubicBBTip, color);
+        cout << "dopo 2ndo draw" << endl;
+        // Connette la base con la punta
+        for(int i = 0; i < 4; i++) {
+            Point2f base_point(cubicBBBase.at<float>(i, 0), cubicBBBase.at<float>(i, 1));
+            Point2f tip_point(cubicBBTip.at<float>(i, 0), cubicBBTip.at<float>(i, 1));
+            line(img, base_point, tip_point, color, 2);
+        }
+        cout << "fine draw" << endl;
+        return img;
+    }
+
+    Mat drawRectangle(Mat& img, const Mat& rectangle, const Scalar& color) {
+        for(int i = 0; i < 4; i++) {
+            Point2f current_point(rectangle.at<float>(i, 0), rectangle.at<float>(i, 1));
+            Point2f next_point;
+
+            if(i == 3) {
+                next_point = Point2f(rectangle.at<float>(0, 0), rectangle.at<float>(0, 1));
+            } else {
+                next_point = Point2f(rectangle.at<float>(i + 1, 0), rectangle.at<float>(i + 1, 1));
+            }
+
+            line(img, current_point, next_point, color, 2);
+        }
+
+        return img;
     }
 };
 
@@ -673,7 +757,7 @@ private:
             }
 
             int64 t = getTickCount();
-            auto [processed, morph] = tracker.process(frame);
+            auto [kmeans, processed, morph] = tracker.process(frame);
             t = getTickCount() - t;
 
             double fps = getTickFrequency() / (double)t;
@@ -724,6 +808,7 @@ private:
     thread videoThread;
     atomic<bool> running;
 };
+
 
 void calcChessboardCorners(Size boardSize, float squareSize, vector<Point3f>& corners, Pattern patternType = CHESSBOARD)
 {
@@ -980,6 +1065,74 @@ static bool loadCameraParams(const string& filename, Size& imageSize, Size& boar
 	return 0;
 }
 
+pair<Mat,Mat> calc_homography(const string &filePath, Mat& cameraMatrix, Mat& distCoeffs, Size& boardSize)
+{
+    Mat H_float, H_inv;
+    try{
+        //termination criteria
+        TermCriteria criteria = TermCriteria(TermCriteria::EPS + TermCriteria::MAX_ITER, 30, 0.001);
+
+        //! [compute-image-points]
+        vector<Point3f> objectPoints;
+        vector<Point2f> imagePoints;
+        Mat img = imread( samples::findFile( filePath) );
+        Size imageSize = img.size();
+        Mat newcameramtx = getOptimalNewCameraMatrix(cameraMatrix, distCoeffs, imageSize, 1, imageSize);
+
+        Mat undistorted; // Crea una nuova Mat per l'output
+        undistort(img, undistorted, cameraMatrix, distCoeffs, newcameramtx);
+        Mat gray;
+        cvtColor(undistorted, gray, COLOR_BGR2GRAY);
+
+       //prepare object points, like (0,0,0), (1,0,0), (2,0,0) ....,(6,5,0)
+        Mat objp = Mat::zeros(boardSize.width * boardSize.height, 3, CV_32F);
+        for(int i = 0; i < boardSize.height; i++) {
+            for(int j = 0; j < boardSize.width; j++) {
+                objp.at<float>(i * boardSize.width + j, 0) = j;
+                objp.at<float>(i * boardSize.width + j, 1) = i;
+                // La terza coordinata rimane 0
+            }
+        }
+
+        vector<Point3f> axis = {Point3f(0, 0, 0), Point3f(0, 3, 0), Point3f(3, 3, 0), Point3f(3, 0, 0),
+                                Point3f(0, 0, -3), Point3f(0, 3, -3), Point3f(3, 3, -3), Point3f(3, 0, -3)};
+
+        // Trova gli angoli della scacchiera
+        vector<Point2f> corners;
+        bool found = findChessboardCorners(undistorted, boardSize, corners);
+        if (!found) {
+            throw runtime_error("Impossibile trovare gli angoli della scacchiera");
+        }
+
+        cornerSubPix(gray, corners, Size(11,11), Size(-1,-1), criteria);
+        //Find the rotation and translation vectors.
+        Mat rvecs, tvecs;
+        solvePnP(objp, corners, newcameramtx, distCoeffs, rvecs, tvecs);
+        // project 3D points to image plane (USED ONLY FOR OPENCV DEMO CUBE)
+        vector<Point2f> imgpts_float;
+        projectPoints(axis, rvecs, tvecs, newcameramtx, distCoeffs, imgpts_float);
+        vector<Point2i> imgpts;
+
+        // Converte ogni punto da float a int
+        for(const auto &pt : imgpts_float) {
+            imgpts.push_back(Point2i(cvRound(pt.x), cvRound(pt.y)));
+        }
+
+        //computing homography matrix and it inverse
+        Mat H = findHomography(objp, corners);
+        if(H.type() != CV_32F) {
+            H.convertTo(H_float, CV_32F);
+        } else {
+            H_float = H;
+        }
+        H_inv = H_float.inv();
+    } catch(const cv::Exception& e){
+        cout << "Errore Homography" << endl;
+    }
+    return {H_float, H_inv};
+}
+
+
 int main(int argc, char** argv) {
 
     float squareSize, grid_width, aspectRatio = 1;
@@ -1085,6 +1238,11 @@ int main(int argc, char** argv) {
     }
     //end CALIBRATION AND PARAMS SAVED
 
+    //omografia
+    cout << "Prima di Homography" << endl;
+    auto [homography, homographyInv] = calc_homography("res/floor_surface/piano_pav (4).jpg", cameraMatrix, distCoeffs, boardSize);
+    cout << "<Dopo> Homography" << endl;
+
     VideoCapture cap;
     if (file.empty())
         cap.open(camera);
@@ -1104,8 +1262,9 @@ int main(int argc, char** argv) {
     OpticalFlowTracker tracker(x, y, width, height);
     Mat frame;
     
-    namedWindow("colours", WINDOW_AUTOSIZE);
-    namedWindow("bw", WINDOW_AUTOSIZE);
+    //namedWindow("kmeans", WINDOW_AUTOSIZE);
+    namedWindow("dbscan", WINDOW_AUTOSIZE);
+    //namedWindow("bw-morph", WINDOW_AUTOSIZE);
 
     // Training phase - first 10 frames
     for(int i = 0; i < 10; i++) {
@@ -1113,6 +1272,8 @@ int main(int argc, char** argv) {
         if(frame.empty()) break;
         tracker.init(frame, i);
     }
+
+    tracker.initialize();
 
     while (true) {
         cap >> frame;
@@ -1125,15 +1286,18 @@ int main(int argc, char** argv) {
         }
 
         int64 t = getTickCount();
-        auto [processed, morph] = tracker.process(frame);
+        auto [kmeans, processed, morph] = tracker.process(frame);
         t = getTickCount() - t;
         double fps = getTickFrequency() / (double)t;
 
         putText(processed, "FPS: " + to_string(int(fps)), Point(10, 30), 
                 FONT_HERSHEY_SIMPLEX, 1, Scalar(0,255,0), 2);
 
-        imshow("colours", processed);
-        imshow("bw", morph);
+        Mat res_img = tracker.process3D(processed, homography, homographyInv);
+        imshow("result", res_img);
+        //imshow("kmeans", kmeans);
+        imshow("dbscan", processed);
+        //imshow("bw-morph", morph);
 
         char key = (char)waitKey(delay);
         if (key == 27) break;  // ESC
