@@ -54,11 +54,6 @@ class OpticalFlowTracker {
     cv::Size winSize;
     int maxLevel;
 
-    // Nuovi parametri per il filtraggio delle occorrenze
-    float magnitudeTolerance;  // Tolleranza per confrontare i moduli
-    float angleTolerance;      // Tolleranza per confrontare gli angoli (in radianti)
-    int minOccurrences;        // Numero minimo di occorrenze per considerare un gruppo
-
     // Background subtractor
     cv::Ptr<cv::BackgroundSubtractorMOG2> backSub;
 
@@ -89,7 +84,6 @@ private:
     std::vector<ClusterData> cluster_points;
 
 private:
-    // Modifica la funzione helper per includere le informazioni di gruppo
     NDArray<float, 2> convertToNDArray(const Mat& normalizedData) {
         NDArray<float, 2> arrayData({(size_t)normalizedData.rows, (size_t)2});
         
@@ -110,12 +104,6 @@ public:
           criteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 10, 0.03),
           winSize(15, 15), // 21 21 
           maxLevel(2), // 3
-
-          // Inizializzazione dei nuovi parametri
-          magnitudeTolerance(2.5f),
-          angleTolerance(0.35f),
-          minOccurrences(7),
-
           frame_counter(0),
           detectionWindow(x, y, width, height),
           useWindow(width > 0 && height > 0)
@@ -152,27 +140,9 @@ public:
         }
     }
 
-    // Funzione per verificare se due movimenti sono simili
-    bool areSimilarMovements(float mag1, float ang1, float mag2, float ang2, 
-                            float magTolerance = 1.5f, float angTolerance = 0.15f) {
-        // Verifica se il modulo è simile (entro la tolleranza)
-        bool similarMagnitude = std::abs(mag1 - mag2) <= magTolerance;
-        
-        // Calcola la differenza angolare minima (considerando la circolarità)
-        float angDiff = std::abs(ang1 - ang2);
-        float twoPi = 2.0f * static_cast<float>(CV_PI);
-        angDiff = std::min(angDiff, twoPi - angDiff);
-        bool similarAngle = angDiff <= angTolerance;
-        
-        return similarMagnitude && similarAngle;
-    }
-
-    // Funzione per raggruppare i punti simili e contare le occorrenze
-    std::vector<FeaturePoint> filterByOccurrences(const std::vector<Point2f>& current,
-                                                const std::vector<Point2f>& previous) {
+    std::vector<FeaturePoint> prepareFeaturePoints(const std::vector<Point2f>& current, const std::vector<Point2f>& previous) {
         std::vector<FeaturePoint> allFeatures;
         
-        // Prima passiamo crea tutti i FeaturePoint
         for(size_t i = 0; i < current.size(); i++) {
             FeaturePoint fp;
             fp.position = current[i];
@@ -184,17 +154,9 @@ public:
         return allFeatures;
     }
 
-    std::vector<FeaturePoint> prepareFeaturePoints(
-        const std::vector<Point2f>& current, const std::vector<Point2f>& previous) {
-    
-        // Prima filtra i punti basandosi sulle occorrenze
-        return filterByOccurrences(current, previous);
-    }
-
     Mat prepareDataForClustering(const vector<FeaturePoint>& features) {
         if(features.empty()) return Mat();
 
-        // Aumentiamo il numero di colonne per includere le nuove feature
         Mat data(features.size(), 2, CV_32F);  // x,y
 
         // Trova i valori min e max per normalizzazione
@@ -384,8 +346,8 @@ public:
         return colors;
     }
 
-    std::tuple<cv::Mat, cv::Mat, cv::Mat> process(cv::Mat& frame) {
-        if(frame.empty()) return std::make_tuple(cv::Mat(), cv::Mat(), cv::Mat());
+    std::pair<cv::Mat, cv::Mat> process(cv::Mat& frame) {
+        if(frame.empty()) return {cv::Mat(), cv::Mat()};
 
         old_gray = frame_gray.clone();
         cv::cvtColor(frame, frame_gray, cv::COLOR_BGR2GRAY);
@@ -422,8 +384,6 @@ public:
         std::vector<uchar> status;
         std::vector<float> err;
 
-        cv::Mat kmeansOutput;
-
         try {
             cv::calcOpticalFlowPyrLK(old_gray, frame_gray,
                 shi_tomasi_keypoints, displaced_kp,
@@ -434,7 +394,7 @@ public:
         } catch (const cv::Exception& e) {
             shi_tomasi_keypoints.clear();
             frame_counter = 0;
-            return std::make_tuple(cv::Mat(), frame, fgMask);
+            return {frame, fgMask};
         }
 
         std::vector<cv::Point2f> good_new, good_old;
@@ -456,17 +416,15 @@ public:
                 Mat data = prepareDataForClustering(features);
                 if(!data.empty()) {
                     try {
-                        // Raccogli i dati di foreground mantenendo la normalizzazione
                         std::vector<int> fgIndices;
                         for(int i = 0; i < data.rows; i++) {
                             fgIndices.push_back(i);
                         }
 
-                        // Converti i punti in NDArray, includendo le informazioni di gruppo
+                        // Converti i punti in NDArray
                         NDArray<float, 2> pointsArray = convertToNDArray(data); //convertToNDArray(fgData);
                         
-                        // Crea e applica DBSCAN con i parametri aggiustati per considerare le nuove feature
-                        // Aumentiamo leggermente eps perché ora abbiamo più dimensioni
+                        // Crea e applica DBSCAN 
                         DBSCAN<float> dbscan(pointsArray, 0.2f, 6); // 0.3 8
                         dbscan.run();
 
@@ -532,7 +490,7 @@ public:
         shi_tomasi_keypoints = displaced_kp;
         frame_counter = (frame_counter + 1) % 15;
 
-        return std::make_tuple(kmeansOutput, output, morph);
+        return {output, morph};
     }
 
     Mat render3DBoundingBox(Mat& img, const Mat& clusterBB, const Mat& cubicBBBase, int delta_Z, const Scalar& color) {
@@ -707,7 +665,7 @@ private:
             }
 
             int64 t = getTickCount();
-            auto [kmeans, processed, morph] = tracker.process(frame);
+            auto [processed, morph] = tracker.process(frame);
             t = getTickCount() - t;
 
             double fps = getTickFrequency() / (double)t;
@@ -1144,7 +1102,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    //start CALIBRATION AND PARAMS SAVED
     if(loadCameraParams(outputFilename, imageSize, boardSize, cameraMatrix, distCoeffs, squareSize, totalAvgErr)) {
         cout << "CALIBRATED" << endl;
     } else {
@@ -1163,10 +1120,8 @@ int main(int argc, char** argv) {
             Mat img = imread( samples::findFile( imagePath) );
             imageSize = img.size();
             Mat img_corners = img.clone(), img_pose = img.clone();
-            //! [find-chessboard-corners]
             vector<Point2f> corners;
             bool found = findChessboardCorners(img, boardSize, corners);
-            //! [find-chessboard-corners]
 
             if (!found)
             {
@@ -1175,10 +1130,6 @@ int main(int argc, char** argv) {
             }else{
                 imagePoints.push_back(corners);
             }
-
-            //drawChessboardCorners(img_corners, boardSize, corners, found);
-            //imshow("Chessboard corners detection", img_corners);
-            //waitKey();
         }
 
         if( imagePoints.size() > 0 )
@@ -1186,9 +1137,7 @@ int main(int argc, char** argv) {
                                    boardSize, pattern, squareSize, grid_width,
                                    aspectRatio, flags, cameraMatrix, distCoeffs);
     }
-    //end CALIBRATION AND PARAMS SAVED
 
-    //omografia
     auto [homography, homographyInv] = calc_homography("res/floor_surface/piano_pav (4).jpg", cameraMatrix, distCoeffs, boardSize);
 
     VideoCapture cap;
@@ -1233,7 +1182,7 @@ int main(int argc, char** argv) {
             break;
         }
 
-        auto [kmeans, processed, morph] = tracker.process(frame);
+        auto [processed, morph] = tracker.process(frame);
         Mat processed_clone = processed.clone();
 
         Mat res_img = tracker.process3D(processed_clone, homography, homographyInv);
